@@ -258,22 +258,47 @@ async def send_question(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 async def _send_single_answer_question(context, chat_id: int, user_id: int,
                                        question: dict, exam_mode: bool) -> None:
-    """Use Telegram's native quiz poll for single-answer questions."""
+    """For single-answer questions:
+    - If question + every option fits Telegram's poll limits (300 + 100 chars), use a quiz poll
+    - Otherwise, fall back to the same inline-button flow we use for multi-answer
+      so the full text is visible.
+    """
     options_letters = sorted(question["options"].keys())  # ['A','B','C','D'] usually
-    options_texts = [
-        truncate(f"{ltr}. {question['options'][ltr]}", 100)
+    suffix = " ⏱" if exam_mode else ""
+    full_question = question["question_text"]
+
+    # Telegram limits: poll question 300, each option 100. If anything exceeds → use inline
+    options_fit = all(
+        len(f"{ltr}. {question['options'][ltr]}") <= 100
         for ltr in options_letters
-    ]
+    )
+    question_fits = len(full_question) + len(suffix) <= 300
+
+    if not options_fit:
+        # Fall through to inline-button flow so the full option text is visible
+        await _send_inline_button_question(context, chat_id, user_id, question, exam_mode)
+        return
+
+    # Quiz-poll path
+    options_texts = [f"{ltr}. {question['options'][ltr]}" for ltr in options_letters]
     correct_letter = question["correct"][0]
     correct_index = options_letters.index(correct_letter)
 
-    suffix = " ⏱" if exam_mode else ""
-    q_text = truncate(question["question_text"] + suffix, 300)
+    if not question_fits:
+        # Send full question as a normal message first
+        from html import escape
+        timer_note = " ⏱" if exam_mode else ""
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"<b>📋 Question:</b>{timer_note}\n\n{escape(full_question)}",
+            parse_mode=ParseMode.HTML,
+        )
+        q_text = "👆 See question above. Pick your answer:"
+    else:
+        q_text = full_question + suffix
 
-    # Strip the explanation for the poll's tiny "explanation" field — full one comes after
     poll_explanation = truncate(
-        f"Correct: {correct_letter}. See full explanation below.",
-        200,
+        f"Correct: {correct_letter}. See full explanation below.", 200,
     )
 
     msg = await context.bot.send_poll(
@@ -304,6 +329,46 @@ async def _send_single_answer_question(context, chat_id: int, user_id: int,
             _exam_timeout_single,
             EXAM_TIMER_SECONDS + 2,  # small buffer after Telegram closes the poll
             data={"poll_id": poll_id},
+            name=f"exam:{user_id}:{question['id']}",
+        )
+
+
+async def _send_inline_button_question(context, chat_id: int, user_id: int,
+                                        question: dict, exam_mode: bool) -> None:
+    """Single-answer question rendered with inline buttons (used when options are too long for a quiz poll)."""
+    options_block = "\n".join(
+        f"<b>{ltr}.</b> {question['options'][ltr]}"
+        for ltr in sorted(question["options"].keys())
+    )
+    instruction = "📝 <b>Pick one answer</b>"
+    if exam_mode:
+        instruction += f" ⏱ <i>{EXAM_TIMER_SECONDS}s</i>"
+
+    text = (
+        f"{instruction}\n\n"
+        f"{question['question_text']}\n\n"
+        f"{options_block}"
+    )
+
+    msg = await context.bot.send_message(
+        chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
+        reply_markup=selection_keyboard(question["id"], question["options"], selected=[]),
+    )
+
+    context.user_data.setdefault("multi_state", {})[question["id"]] = {
+        "selected": [],
+        "message_id": msg.message_id,
+        "chat_id": chat_id,
+        "exam_mode": exam_mode,
+        "single_choice": True,  # behave like radio buttons, not checkboxes
+    }
+
+    if exam_mode:
+        context.job_queue.run_once(
+            _exam_timeout_multi,
+            EXAM_TIMER_SECONDS,
+            data={"user_id": user_id, "chat_id": chat_id,
+                  "question_id": question["id"], "message_id": msg.message_id},
             name=f"exam:{user_id}:{question['id']}",
         )
 
@@ -514,10 +579,18 @@ async def _toggle_multi_option(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     selected = state["selected"]
-    if letter in selected:
-        selected.remove(letter)
+    if state.get("single_choice"):
+        # Radio-button behaviour: tapping selects only that letter (replacing any prior choice).
+        # Tapping the already-selected letter de-selects it.
+        if selected == [letter]:
+            selected = []
+        else:
+            selected = [letter]
     else:
-        selected.append(letter)
+        if letter in selected:
+            selected.remove(letter)
+        else:
+            selected.append(letter)
     state["selected"] = selected
 
     try:
