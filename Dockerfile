@@ -14,8 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source
 COPY bot.py database.py questions.json ./
 
-# SQLite file lives next to the code — mount a volume here in prod
-# so stats survive redeploys: -v /your/data:/app
-VOLUME ["/app"]
+
+
 
 CMD ["python", "-u", "bot.py"]
